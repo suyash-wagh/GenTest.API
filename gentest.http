@@ -1,0 +1,6 @@
+@gentest_HostAddress = http://localhost:5220
+
+GET {{gentest_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
