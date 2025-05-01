@@ -56,8 +56,6 @@ namespace gentest.Controllers
                 return BadRequest("Swagger file path and selected endpoints are required.");
             }
 
-            // Assuming GenerateTestsAsync in ITestGenerationService can take a list of selected endpoints
-            // You might need to adjust the ITestGenerationService interface and implementation
             var testCases = await _testGenerationService.GenerateTestCasesAsync(request.SwaggerFilePath, request.SelectedEndpoints);
 
             if (testCases == null || !testCases.Any())
@@ -65,7 +63,7 @@ namespace gentest.Controllers
                 return StatusCode(500, "Error generating test cases or no test cases generated for selected endpoints.");
             }
 
-            return Ok(new GenerateTestsResponse { TestCases = testCases });
+            return Ok(testCases);
         }
 
         [HttpPost("execute-tests")]
