@@ -1,20 +1,13 @@
-using Microsoft.AspNetCore.Http;
-using System.IO;
-using System.Threading.Tasks;
 using Microsoft.OpenApi.Readers;
-using Microsoft.OpenApi.Models;
-using System.Collections.Generic;
-using System.Linq;
 
 namespace gentest.Services
 {
     public class SwaggerFileService : ISwaggerFileService
     {
-        private readonly string _uploadDirectory = "Uploads"; // Define an upload directory
+        private readonly string _uploadDirectory = "Uploads"; 
 
         public SwaggerFileService()
         {
-            // Ensure the upload directory exists
             Directory.CreateDirectory(_uploadDirectory);
         }
 
@@ -22,10 +15,9 @@ namespace gentest.Services
         {
             if (file == null || file.Length == 0)
             {
-                return null; // Or throw an exception
+                return null;
             }
 
-            // Generate a unique file name to avoid conflicts
             var fileName = Path.Combine(_uploadDirectory, Path.GetRandomFileName() + ".json");
 
             using (var stream = new FileStream(fileName, FileMode.Create))
@@ -33,7 +25,7 @@ namespace gentest.Services
                 await file.CopyToAsync(stream);
             }
 
-            return fileName; // Return the path to the saved file
+            return fileName; 
         }
 
         public async Task<List<string>> ParseSwaggerFileAsync(string filePath)
@@ -51,9 +43,7 @@ namespace gentest.Services
 
                     if (diagnostic.Errors.Any())
                     {
-                        // Log errors if any
-                        // _logger.LogError("Swagger file parsing errors: {Errors}", string.Join(", ", diagnostic.Errors.Select(e => e.Message)));
-                        return new List<string>(); // Or throw an exception
+                        return new List<string>();
                     }
 
                     var endpoints = new List<string>();
@@ -69,9 +59,7 @@ namespace gentest.Services
             }
             catch (Exception ex)
             {
-                // Log exception
-                // _logger.LogError(ex, "Error parsing Swagger file");
-                return new List<string>(); // Or throw an exception
+                return new List<string>();
             }
         }
     }

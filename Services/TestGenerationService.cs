@@ -14,17 +14,20 @@ namespace gentest.Services
         private readonly ILogger<TestGenerationService> _logger;
         private readonly LlmProviderSettings _settings;
         private readonly ISwaggerFileService _swaggerFileService;
+        private readonly ITestCaseExtractionService _testCaseExtractionService;
 
         public TestGenerationService(
             IHttpClientFactory httpClientFactory,
             IOptions<LlmProviderSettings> settings,
             ILogger<TestGenerationService> logger,
-            ISwaggerFileService swaggerFileService)
+            ISwaggerFileService swaggerFileService,
+            ITestCaseExtractionService testCaseExtractionService)
         {
             _httpClientFactory = httpClientFactory;
             _settings = settings.Value;
             _logger = logger;
             _swaggerFileService = swaggerFileService;
+            _testCaseExtractionService = testCaseExtractionService;
         }
 
         public async Task<List<TestCase>> GenerateTestCasesAsync(string swaggerFilePath, List<string> selectedEndpoints)
@@ -65,7 +68,7 @@ namespace gentest.Services
 
                             string geminiResponse = await CallGeminiAsync(prompt);
 
-                            var testCasesForEndpoint = ExtractTestCasesFromResponse(geminiResponse);
+                            var testCasesForEndpoint = _testCaseExtractionService.ExtractTestCasesFromResponse(geminiResponse);
                             generatedTestCases.AddRange(testCasesForEndpoint);
 
                             _logger.LogInformation("Generated {Count} test cases for endpoint: {HttpMethod} {Path}", testCasesForEndpoint.Count, httpMethod, path);
@@ -90,7 +93,6 @@ namespace gentest.Services
             return generatedTestCases;
         }
 
-        // Internal method to parse Swagger file (can be moved to SwaggerFileService if preferred)
         private async Task<OpenApiDocument> ParseSwaggerFileInternalAsync(string filePath)
         {
              if (string.IsNullOrEmpty(filePath) || !System.IO.File.Exists(filePath))
@@ -106,7 +108,6 @@ namespace gentest.Services
 
                     if (diagnostic.Errors.Any())
                     {
-                        // Log errors if any
                         _logger.LogError("Swagger file parsing errors: {Errors}", string.Join(", ", diagnostic.Errors.Select(e => e.Message)));
                         return null;
                     }
@@ -116,7 +117,6 @@ namespace gentest.Services
             }
             catch (Exception ex)
             {
-                // Log exception
                 _logger.LogError(ex, "Error parsing Swagger file internally");
                 return null;
             }
@@ -133,7 +133,6 @@ namespace gentest.Services
             promptBuilder.AppendLine("You are an API testing expert tasked with generating comprehensive test cases for REST APIs based on OpenAPI/Swagger specifications. These test cases will be executed automatically against the API endpoints.");
             promptBuilder.AppendLine();
             
-            // Populate the input section with actual API details
             promptBuilder.AppendLine("## INPUT");
             promptBuilder.AppendLine("The following OpenAPI endpoint details have been provided:");
             promptBuilder.AppendLine($"- Endpoint path: {path}");
@@ -141,7 +140,6 @@ namespace gentest.Services
             promptBuilder.AppendLine($"- Operation ID: {operation.OperationId ?? "Not specified"}");
             promptBuilder.AppendLine($"- Description: {operation.Description ?? "Not provided"}");
             
-            // Process request parameters
             promptBuilder.AppendLine("- Request parameters:");
             if (operation.Parameters != null && operation.Parameters.Count > 0)
             {
@@ -159,7 +157,6 @@ namespace gentest.Services
                 promptBuilder.AppendLine("  * None");
             }
             
-            // Process request body
             promptBuilder.AppendLine("- Request body schema:");
             if (operation.RequestBody != null && operation.RequestBody.Content.Count > 0)
             {
@@ -177,7 +174,6 @@ namespace gentest.Services
                 promptBuilder.AppendLine("  * None");
             }
             
-            // Process response schemas
             promptBuilder.AppendLine("- Response schemas:");
             if (operation.Responses != null && operation.Responses.Count > 0)
             {
@@ -202,7 +198,6 @@ namespace gentest.Services
                 promptBuilder.AppendLine("  * None specified");
             }
             
-            // Process security requirements
             promptBuilder.AppendLine("- Security requirements:");
             if (operation.Security != null && operation.Security.Count > 0)
             {
@@ -219,7 +214,6 @@ namespace gentest.Services
                 promptBuilder.AppendLine("  * None specified");
             }
             
-            // Add the remaining sections from our test case generator prompt
             promptBuilder.AppendLine();
             promptBuilder.AppendLine("## TASK");
             promptBuilder.AppendLine("Generate executable test cases for this endpoint covering:");
@@ -339,82 +333,6 @@ namespace gentest.Services
             return responseObject?.Candidates?[0]?.Content?.Parts?[0]?.Text ?? string.Empty;
         }
 
-        private List<TestCase> ExtractTestCasesFromResponse(string response)
-        {
-            var testCases = new List<TestCase>();
-            
-            try
-            {
-                // Extract JSON arrays from the response
-                var jsonArrayMatches = System.Text.RegularExpressions.Regex.Matches(
-                    response,
-                    @"\[\s*\{(?:[^{}]|(?<open>\{)|(?<-open>\}))*(?(open)(?!))\}\s*\]",
-                    System.Text.RegularExpressions.RegexOptions.Singleline
-                );
-                
-                if (jsonArrayMatches.Count > 0)
-                {
-                    // Try to parse the first JSON array found
-                    var jsonArray = jsonArrayMatches[0].Value;
-                    try
-                    {
-                        var extractedTestCases = JsonSerializer.Deserialize<List<TestCase>>(jsonArray, new JsonSerializerOptions
-                        {
-                            PropertyNameCaseInsensitive = true
-                        });
-                        
-                        if (extractedTestCases != null && extractedTestCases.Count > 0)
-                        {
-                            testCases.AddRange(extractedTestCases);
-                            _logger.LogInformation("Successfully extracted {Count} test cases from LLM response", extractedTestCases.Count);
-                        }
-                    }
-                    catch (JsonException arrayEx)
-                    {
-                        _logger.LogWarning(arrayEx, "Failed to parse JSON array, trying to extract individual test cases");
-                        
-                        // If array parsing fails, try to extract individual JSON objects
-                        var jsonObjectMatches = System.Text.RegularExpressions.Regex.Matches(
-                            response,
-                            @"\{(?:[^{}]|(?<open>\{)|(?<-open>\}))*(?(open)(?!))\}",
-                            System.Text.RegularExpressions.RegexOptions.Singleline
-                        );
-                        
-                        foreach (System.Text.RegularExpressions.Match match in jsonObjectMatches)
-                        {
-                            try
-                            {
-                                var testCase = JsonSerializer.Deserialize<TestCase>(match.Value, new JsonSerializerOptions
-                                {
-                                    PropertyNameCaseInsensitive = true
-                                });
-                                
-                                if (testCase != null && !string.IsNullOrEmpty(testCase.TestCaseId))
-                                {
-                                    testCases.Add(testCase);
-                                }
-                            }
-                            catch (JsonException objEx)
-                            {
-                                _logger.LogDebug(objEx, "Failed to parse individual JSON object: {Json}", match.Value);
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    _logger.LogWarning("No JSON array found in LLM response");
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error extracting test cases from LLM response");
-            }
-            
-            return testCases;
-        }
-
-        // Helper method to serialize schema for the prompt
         private string SerializeSchemaForPrompt(OpenApiSchema schema)
         {
             var result = new StringBuilder();
@@ -469,7 +387,7 @@ namespace gentest.Services
                 "HEAD" => OperationType.Head,
                 "PATCH" => OperationType.Patch,
                 "TRACE" => OperationType.Trace,
-                _ => OperationType.Get // Default to Get for unknown
+                _ => OperationType.Get
             };
         }
     }
