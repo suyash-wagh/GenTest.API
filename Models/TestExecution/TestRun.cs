@@ -1,4 +1,4 @@
-namespace gentest.Models.TestExecution
+namespace GenTest.Models.TestExecution
 {
     public class TestRun
     {

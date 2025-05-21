@@ -1,38 +1,69 @@
 using System.Text.Json.Serialization;
-using gentest.Models.Common;
 
-namespace gentest.Models.Common
+namespace GenTest.Models.Common
 {
     public class TestCase
     {
         [JsonPropertyName("testCaseId")]
-        public string TestCaseId { get; set; }
-        
+        public required string TestCaseId { get; set; }
+
         [JsonPropertyName("testCaseName")]
-        public string TestCaseName { get; set; }
-        
-        [JsonPropertyName("testCaseDescription")]
-        public string TestCaseDescription { get; set; }
-        
-        [JsonPropertyName("testCaseType")]
-        public string TestCaseType { get; set; }
-        
+        public string? TestCaseName { get; set; }
+
+        [JsonPropertyName("description")]
+        public string? Description { get; set; }
+
         [JsonPropertyName("priority")]
-        public string Priority { get; set; }
+        public TestPriority Priority { get; set; } = TestPriority.Medium;
+
+        [JsonPropertyName("tags")]
+        public List<string>? Tags { get; set; } = new List<string>();
+
+        [JsonPropertyName("prerequisites")] // List of TestCaseIds that must pass before this one runs
+        public List<string>? Prerequisites { get; set; } = new List<string>();
+
+        [JsonPropertyName("variables")] // Variables defined at the test case level
+        public Dictionary<string, object>? Variables { get; set; } = new Dictionary<string, object>();
         
-        [JsonPropertyName("prerequisites")]
-        public List<string> Prerequisites { get; set; }
-        
+        [JsonPropertyName("authentication")]
+        public AuthenticationDetails? Authentication { get; set; }
+
         [JsonPropertyName("request")]
-        public TestRequest Request { get; set; }
-        
-        [JsonPropertyName("expectedResponse")]
-        public TestResponse ExpectedResponse { get; set; }
-        
+        public required TestRequest Request { get; set; }
+
+        [JsonPropertyName("expectedResponse")] // Optional, assertions are primary
+        public TestResponse? ExpectedResponse { get; set; }
+
         [JsonPropertyName("assertions")]
-        public List<TestAssertion> Assertions { get; set; }
-        
-        [JsonPropertyName("mockRequirements")]
-        public List<MockRequirement> MockRequirements { get; set; }
+        public List<TestAssertion> Assertions { get; set; } = new List<TestAssertion>();
+
+        [JsonPropertyName("extractVariables")] // Rules to extract variables from the response
+        public List<VariableExtractionRule>? ExtractVariables { get; set; }
+
+        [JsonPropertyName("mockRequirements")] // Kept for future use
+        public List<MockRequirement>? MockRequirements { get; set; }
+
+        [JsonPropertyName("skip")]
+        public bool Skip { get; set; } = false;
+    }
+
+    public enum TestPriority
+    {
+        Lowest,
+        Low,
+        Medium,
+        High,
+        Highest
+    }
+
+    public enum HttpMethodExtended
+    {
+        GET,
+        POST,
+        PUT,
+        DELETE,
+        PATCH,
+        HEAD,
+        OPTIONS
     }
 }

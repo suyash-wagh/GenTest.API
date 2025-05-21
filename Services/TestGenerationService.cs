@@ -1,394 +1,492 @@
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
-using Microsoft.OpenApi.Models;
-using gentest.Models.Common;
-using gentest.Models.TestGeneration;
-using Microsoft.OpenApi.Readers;
+using GenTest.Models.ApiDefinition;
+using GenTest.Models.Common;
+using GenTest.Models.TestGeneration;
+using GenTest.Services.ApiParsing;
 
-namespace gentest.Services
+namespace GenTest.Services
 {
-    public class TestGenerationService : ITestGenerationService
+    public class TestGenerationService(
+        IHttpClientFactory httpClientFactory,
+        IOptions<LlmProviderSettings> settings,
+        ILogger<TestGenerationService> logger,
+        IEnumerable<IApiDefinitionParser> apiParsers,
+        ITestCaseExtractionService testCaseExtractionService)
+        : ITestGenerationService
     {
-        private readonly IHttpClientFactory _httpClientFactory;
-        private readonly ILogger<TestGenerationService> _logger;
-        private readonly LlmProviderSettings _settings;
-        private readonly ISwaggerFileService _swaggerFileService;
-        private readonly ITestCaseExtractionService _testCaseExtractionService;
+        private readonly LlmProviderSettings _settings = settings.Value;
 
-        public TestGenerationService(
-            IHttpClientFactory httpClientFactory,
-            IOptions<LlmProviderSettings> settings,
-            ILogger<TestGenerationService> logger,
-            ISwaggerFileService swaggerFileService,
-            ITestCaseExtractionService testCaseExtractionService)
+        public async Task<List<TestCase>> GenerateTestCasesAsync(string swaggerFilePath,
+            List<string>? selectedEndpoints)
         {
-            _httpClientFactory = httpClientFactory;
-            _settings = settings.Value;
-            _logger = logger;
-            _swaggerFileService = swaggerFileService;
-            _testCaseExtractionService = testCaseExtractionService;
+            if (selectedEndpoints == null || selectedEndpoints.Count == 0)
+                return new List<TestCase>();
+            var input = new ApiDefinitionInput
+            {
+                SourceType = ApiDefinitionSourceType.SwaggerFile,
+                SourcePathOrUrl = swaggerFilePath,
+                SelectedEndpoints = selectedEndpoints
+            };
+            return await GenerateTestCasesAsync(input);
         }
 
-        public async Task<List<TestCase>> GenerateTestCasesAsync(string swaggerFilePath, List<string> selectedEndpoints)
+        public async Task<List<TestCase>> GenerateTestCasesAsync(ApiDefinitionInput input)
         {
             var generatedTestCases = new List<TestCase>();
 
-            try
+            if (input.SourceType != ApiDefinitionSourceType.SwaggerFile)
             {
-                // Parse the Swagger file
-                var openApiDocument = await ParseSwaggerFileInternalAsync(swaggerFilePath);
+                logger.LogError("Only SwaggerFile is supported as API definition source type.");
+                return generatedTestCases;
+            }
 
-                if (openApiDocument == null)
-                {
-                    _logger.LogError("Failed to parse Swagger file: {SwaggerFilePath}", swaggerFilePath);
-                    return generatedTestCases;
-                }
+            var parser = apiParsers.FirstOrDefault(p => p.CanParse(ApiDefinitionSourceType.SwaggerFile));
+            if (parser == null)
+            {
+                logger.LogError("No Swagger parser found.");
+                return generatedTestCases;
+            }
 
-                // Iterate through selected endpoints and generate tests for each
-                foreach (var endpoint in selectedEndpoints)
+            List<ApiEndpointInfo> apiEndpoints =
+                await parser.ParseAsync(input);
+
+            if (!apiEndpoints.Any())
+            {
+                logger.LogWarning("No API endpoints found or selected from the provided definition: {Source}",
+                    input.SourcePathOrUrl);
+                return generatedTestCases;
+            }
+
+            logger.LogInformation("Found {Count} endpoints to process for test case generation.", apiEndpoints.Count);
+            
+            foreach (var endpointInfo in apiEndpoints)
+            {
+                try
                 {
-                    var parts = endpoint.Split(' ');
-                    if (parts.Length != 2)
+                    string prompt = BuildTestCaseGeneratorPrompt(endpointInfo);
+                    logger.LogDebug("Generated LLM prompt for endpoint ID {EndpointId}: {Prompt}", endpointInfo.Id,
+                        prompt.Substring(0, Math.Min(prompt.Length, 500)) + "...");
+
+                    string llmResponse = await CallLlmAsync(prompt); // Renamed from CallGeminiAsync
+
+                    if (string.IsNullOrWhiteSpace(llmResponse))
                     {
-                        _logger.LogWarning("Invalid endpoint format: {Endpoint}. Skipping.", endpoint);
+                        logger.LogWarning("LLM returned empty response for endpoint ID {EndpointId}", endpointInfo.Id);
                         continue;
                     }
 
-                    var httpMethod = parts[0].ToUpper();
-                    var path = parts[1];
+                    var testCasesForEndpoint = testCaseExtractionService.ExtractTestCasesFromResponse(llmResponse);
+                    generatedTestCases.AddRange(testCasesForEndpoint);
 
-                    if (openApiDocument.Paths.TryGetValue(path, out var pathItem))
-                    {
-                        if (pathItem.Operations.TryGetValue(GetOperationType(httpMethod), out var operation))
-                        {
-                            // Use the existing logic to build prompt and call Gemini for this operation
-                            string prompt = BuildTestCaseGeneratorPrompt(operation, path, httpMethod);
-                            _logger.LogDebug("Generated prompt for Gemini for {HttpMethod} {Path}: {Prompt}", httpMethod, path, prompt);
-
-                            string geminiResponse = await CallGeminiAsync(prompt);
-
-                            var testCasesForEndpoint = _testCaseExtractionService.ExtractTestCasesFromResponse(geminiResponse);
-                            generatedTestCases.AddRange(testCasesForEndpoint);
-
-                            _logger.LogInformation("Generated {Count} test cases for endpoint: {HttpMethod} {Path}", testCasesForEndpoint.Count, httpMethod, path);
-                        }
-                        else
-                        {
-                            _logger.LogWarning("Operation {HttpMethod} not found for path {Path} in Swagger file.", httpMethod, path);
-                        }
-                    }
-                    else
-                    {
-                        _logger.LogWarning("Path {Path} not found in Swagger file.", path);
-                    }
+                    logger.LogInformation("Generated {Count} test cases for endpoint: {EndpointId} ({Method} {Path})",
+                        testCasesForEndpoint.Count, endpointInfo.Id, endpointInfo.Method, endpointInfo.Path);
                 }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error generating test cases for selected endpoints");
-                throw;
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Error generating test cases for endpoint ID {EndpointId} ({Method} {Path})",
+                        endpointInfo.Id, endpointInfo.Method, endpointInfo.Path);
+                    // Continue with other endpoints
+                }
             }
 
             return generatedTestCases;
         }
 
-        private async Task<OpenApiDocument> ParseSwaggerFileInternalAsync(string filePath)
-        {
-             if (string.IsNullOrEmpty(filePath) || !System.IO.File.Exists(filePath))
-            {
-                return null;
-            }
-
-            try
-            {
-                using (var streamReader = new System.IO.StreamReader(filePath))
-                {
-                    var openApiDocument = new OpenApiStreamReader().Read(streamReader.BaseStream, out var diagnostic);
-
-                    if (diagnostic.Errors.Any())
-                    {
-                        _logger.LogError("Swagger file parsing errors: {Errors}", string.Join(", ", diagnostic.Errors.Select(e => e.Message)));
-                        return null;
-                    }
-
-                    return openApiDocument;
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error parsing Swagger file internally");
-                return null;
-            }
-        }
-
-
-        private string BuildTestCaseGeneratorPrompt(OpenApiOperation operation, string path, string httpMethod)
+        private string BuildTestCaseGeneratorPrompt(ApiEndpointInfo endpointInfo)
         {
             var promptBuilder = new StringBuilder();
-            
+
             promptBuilder.AppendLine("# API Test Case Generator");
-            promptBuilder.AppendLine();
             promptBuilder.AppendLine("## CONTEXT");
-            promptBuilder.AppendLine("You are an API testing expert tasked with generating comprehensive test cases for REST APIs based on OpenAPI/Swagger specifications. These test cases will be executed automatically against the API endpoints.");
+            promptBuilder.AppendLine(
+                "You are an API testing expert. Generate executable test cases for the provided API endpoint. The test cases should be in JSON format, adhering strictly to the TestCase schema defined below.");
             promptBuilder.AppendLine();
-            
-            promptBuilder.AppendLine("## INPUT");
-            promptBuilder.AppendLine("The following OpenAPI endpoint details have been provided:");
-            promptBuilder.AppendLine($"- Endpoint path: {path}");
-            promptBuilder.AppendLine($"- HTTP method: {httpMethod}");
-            promptBuilder.AppendLine($"- Operation ID: {operation.OperationId ?? "Not specified"}");
-            promptBuilder.AppendLine($"- Description: {operation.Description ?? "Not provided"}");
-            
-            promptBuilder.AppendLine("- Request parameters:");
-            if (operation.Parameters != null && operation.Parameters.Count > 0)
+
+            promptBuilder.AppendLine("## INPUT: API Endpoint Details");
+            promptBuilder.AppendLine($"- Endpoint ID: {endpointInfo.Id}");
+            promptBuilder.AppendLine($"- HTTP Method: {endpointInfo.Method.ToString().ToUpper()}");
+            promptBuilder.AppendLine($"- Path: {endpointInfo.Path}");
+            if (!string.IsNullOrWhiteSpace(endpointInfo.Summary))
+                promptBuilder.AppendLine($"- Summary: {endpointInfo.Summary}");
+            if (!string.IsNullOrWhiteSpace(endpointInfo.Description))
+                promptBuilder.AppendLine($"- Description: {endpointInfo.Description}");
+            if (!string.IsNullOrWhiteSpace(endpointInfo.OperationId))
+                promptBuilder.AppendLine($"- Operation ID: {endpointInfo.OperationId}");
+
+            promptBuilder.AppendLine("- Parameters:");
+            if (endpointInfo.Parameters?.Any() == true)
             {
-                foreach (var param in operation.Parameters)
+                foreach (var param in endpointInfo.Parameters)
                 {
-                    string paramLocation = param.In.ToString().ToLower();
-                    string required = param.Required ? "required" : "optional";
-                    string schema = param.Schema?.Type ?? "unknown";
-                    
-                    promptBuilder.AppendLine($"  * {param.Name} ({paramLocation}, {required}, {schema}): {param.Description}");
+                    promptBuilder.AppendLine(
+                        $"  - Name: {param.Name}, In: {param.In}, Required: {param.Required}, Schema: ({param.Schema?.ToString() ?? "any"}), Description: {param.Description ?? "N/A"}");
                 }
             }
             else
             {
-                promptBuilder.AppendLine("  * None");
+                promptBuilder.AppendLine("  - None");
             }
-            
-            promptBuilder.AppendLine("- Request body schema:");
-            if (operation.RequestBody != null && operation.RequestBody.Content.Count > 0)
+
+            promptBuilder.AppendLine("- Request Body:");
+            if (endpointInfo.RequestBody?.Content?.Any() == true)
             {
-                foreach (var content in operation.RequestBody.Content)
+                foreach (var contentEntry in endpointInfo.RequestBody.Content)
                 {
-                    promptBuilder.AppendLine($"  * Content Type: {content.Key}");
-                    if (content.Value.Schema != null)
-                    {
-                        promptBuilder.AppendLine($"    Schema: {SerializeSchemaForPrompt(content.Value.Schema)}");
-                    }
+                    promptBuilder.AppendLine($"  - Content-Type: {contentEntry.Key}");
+                    promptBuilder.AppendLine($"    Schema: ({contentEntry.Value.Schema?.ToString() ?? "any"})");
+                    if (endpointInfo.RequestBody.Required) promptBuilder.AppendLine("    (Required)");
                 }
             }
             else
             {
-                promptBuilder.AppendLine("  * None");
+                promptBuilder.AppendLine("  - None");
             }
-            
-            promptBuilder.AppendLine("- Response schemas:");
-            if (operation.Responses != null && operation.Responses.Count > 0)
+
+            promptBuilder.AppendLine("- Responses:");
+            if (endpointInfo.Responses?.Any() == true)
             {
-                foreach (var response in operation.Responses)
+                foreach (var respEntry in endpointInfo.Responses)
                 {
-                    promptBuilder.AppendLine($"  * Status {response.Key}: {response.Value.Description}");
-                    if (response.Value.Content != null && response.Value.Content.Count > 0)
+                    promptBuilder.AppendLine(
+                        $"  - Status Code: {respEntry.Key}, Description: {respEntry.Value.Description ?? "N/A"}");
+                    if (respEntry.Value.Content?.Any() == true)
                     {
-                        foreach (var content in response.Value.Content)
+                        foreach (var contentEntry in respEntry.Value.Content)
                         {
-                            promptBuilder.AppendLine($"    Content Type: {content.Key}");
-                            if (content.Value.Schema != null)
-                            {
-                                promptBuilder.AppendLine($"    Schema: {SerializeSchemaForPrompt(content.Value.Schema)}");
-                            }
+                            promptBuilder.AppendLine(
+                                $"    - Content-Type: {contentEntry.Key}, Schema: ({contentEntry.Value.Schema?.ToString() ?? "any"})");
+                        }
+                    }
+
+                    if (respEntry.Value.Headers?.Any() == true)
+                    {
+                        promptBuilder.AppendLine("    - Expected Headers:");
+                        foreach (var headerEntry in respEntry.Value.Headers)
+                        {
+                            promptBuilder.AppendLine(
+                                $"      - {headerEntry.Key}: Schema: ({headerEntry.Value.Schema?.ToString() ?? "any"}), Description: {headerEntry.Value.Description ?? "N/A"}");
                         }
                     }
                 }
             }
             else
             {
-                promptBuilder.AppendLine("  * None specified");
+                promptBuilder.AppendLine("  - None defined");
             }
-            
-            promptBuilder.AppendLine("- Security requirements:");
-            if (operation.Security != null && operation.Security.Count > 0)
+
+            promptBuilder.AppendLine("- Security Requirements:");
+            if (endpointInfo.SecurityRequirements?.Any() == true)
             {
-                foreach (var securityRequirement in operation.Security)
+                foreach (var sec in endpointInfo.SecurityRequirements)
                 {
-                    foreach (var scheme in securityRequirement.Keys)
-                    {
-                        promptBuilder.AppendLine($"  * {scheme}");
-                    }
+                    promptBuilder.AppendLine(
+                        $"  - Scheme: {sec.SchemeName}, Scopes: [{(sec.Scopes != null ? string.Join(", ", sec.Scopes) : "N/A")}]");
                 }
             }
             else
             {
-                promptBuilder.AppendLine("  * None specified");
+                promptBuilder.AppendLine("  - None defined (assume public or auth handled globally if applicable)");
             }
-            
+
+
             promptBuilder.AppendLine();
             promptBuilder.AppendLine("## TASK");
-            promptBuilder.AppendLine("Generate executable test cases for this endpoint covering:");
-            promptBuilder.AppendLine("1. Happy path scenarios");
-            promptBuilder.AppendLine("2. Edge cases");
-            promptBuilder.AppendLine("3. Error cases");
-            promptBuilder.AppendLine("4. Security tests");
-            promptBuilder.AppendLine("5. Performance considerations");
+            promptBuilder.AppendLine(
+                "Generate a JSON array of comprehensive and executable test cases. Aim for scenarios covering: happy paths, edge cases (e.g., empty values, min/max lengths, invalid formats for typed fields), error handling (e.g., invalid input, unauthorized), and basic security considerations (e.g., testing without authentication if applicable).");
             promptBuilder.AppendLine();
-            
-            promptBuilder.AppendLine("## OUTPUT FORMAT");
-            promptBuilder.AppendLine("For each test case, provide:");
-            promptBuilder.AppendLine();
+
+            promptBuilder.AppendLine("## OUTPUT FORMAT: JSON Array of TestCase Objects");
+            promptBuilder.AppendLine(
+                "Ensure the output is a valid JSON array. Each object in the array must conform to the following C# based schema (use the enum string values where applicable):");
             promptBuilder.AppendLine("```json");
-            promptBuilder.AppendLine("{");
-            promptBuilder.AppendLine("  \"testCaseId\": \"string\",");
-            promptBuilder.AppendLine("  \"testCaseName\": \"string\",");
-            promptBuilder.AppendLine("  \"testCaseDescription\": \"string\",");
-            promptBuilder.AppendLine("  \"testCaseType\": \"happy_path|edge_case|error_case|security|performance\",");
-            promptBuilder.AppendLine("  \"priority\": \"high|medium|low\",");
-            promptBuilder.AppendLine("  \"prerequisites\": [\"string\"],");
-            promptBuilder.AppendLine("  \"request\": {");
-            promptBuilder.AppendLine("    \"method\": \"string\",");
-            promptBuilder.AppendLine("    \"path\": \"string\",");
-            promptBuilder.AppendLine("    \"headers\": {},");
-            promptBuilder.AppendLine("    \"pathParameters\": {},");
-            promptBuilder.AppendLine("    \"queryParameters\": {},");
-            promptBuilder.AppendLine("    \"body\": {}");
-            promptBuilder.AppendLine("  },");
-            promptBuilder.AppendLine("  \"expectedResponse\": {");
-            promptBuilder.AppendLine("    \"statusCode\": 0,");
-            promptBuilder.AppendLine("    \"headers\": {},");
-            promptBuilder.AppendLine("    \"body\": {}");
-            promptBuilder.AppendLine("  },");
-            promptBuilder.AppendLine("  \"assertions\": [");
-            promptBuilder.AppendLine("    {");
-            promptBuilder.AppendLine("      \"type\": \"response_code|response_body|response_time|header\",");
-            promptBuilder.AppendLine("      \"target\": \"string\",");
-            promptBuilder.AppendLine("      \"condition\": \"equals|contains|exists|not_exists|greater_than|less_than\",");
-            promptBuilder.AppendLine("      \"expectedValue\": \"any\"");
-            promptBuilder.AppendLine("    }");
-            promptBuilder.AppendLine("  ],");
-            promptBuilder.AppendLine("  \"mockRequirements\": [");
-            promptBuilder.AppendLine("    {");
-            promptBuilder.AppendLine("      \"service\": \"string\",");
-            promptBuilder.AppendLine("      \"endpoint\": \"string\",");
-            promptBuilder.AppendLine("      \"response\": {}");
-            promptBuilder.AppendLine("    }");
-            promptBuilder.AppendLine("  ]");
-            promptBuilder.AppendLine("}");
+            promptBuilder.AppendLine(GetJsonTestCaseSchema()); // Dynamically generate this from your models
             promptBuilder.AppendLine("```");
             promptBuilder.AppendLine();
-            
-            promptBuilder.AppendLine("## REQUIREMENTS");
-            promptBuilder.AppendLine("1. Generate at max 3 test cases per endpoint");
-            promptBuilder.AppendLine("2. Ensure test data is realistic and properly formatted");
-            promptBuilder.AppendLine("3. Include appropriate assertions for each test case");
-            promptBuilder.AppendLine("4. Consider dependencies between endpoints if applicable");
-            promptBuilder.AppendLine("5. For security tests, include common vulnerability checks (e.g., injection, authentication bypass)");
-            promptBuilder.AppendLine("6. Generate test cases that are directly executable");
-            promptBuilder.AppendLine("7. Include detailed descriptions explaining the purpose of each test");
+
+            promptBuilder.AppendLine("## REQUIREMENTS & INSTRUCTIONS:");
+            promptBuilder.AppendLine(
+                "1.  **Strict JSON**: Output MUST be a valid JSON array `[{...}, {...}]`. Do NOT include any explanatory text outside this JSON structure.");
+            promptBuilder.AppendLine(
+                "2.  **Max 2 Test Cases**: Generate a diverse set of 3 to 5 test cases per endpoint.");
+            promptBuilder.AppendLine(
+                "3.  **TestCaseId**: Generate a unique, descriptive ID (e.g., `TC_GetUser_Success`, `TC_CreateOrder_InvalidItem`).");
+            promptBuilder.AppendLine("4.  **Priority**: Use `Lowest`, `Low`, `Medium`, `High`, `Highest`.");
+            promptBuilder.AppendLine(
+                "5.  **HttpMethodExtended**: Use `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`.");
+            promptBuilder.AppendLine(
+                "6.  **Authentication**: If security is defined (e.g. Bearer, Basic), include a placeholder `authentication` object. If no auth is specified, set `authentication: null` or omit it. For example: `\"authentication\": {\"type\": \"BearerToken\", \"token\": \"{{bearer_token_variable}}\"}` or `\"authentication\": {\"type\": \"Basic\", \"username\": \"testuser\", \"password\": \"{{test_password}}\"}`. Use variables like `{{...}}` for sensitive or dynamic auth values.");
+            promptBuilder.AppendLine(
+                "7.  **Request Path**: Use the exact path from input. For path parameters like `/users/{id}`, populate `request.pathParameters`: `{\"id\": \"someValue\"}`.");
+            promptBuilder.AppendLine(
+                "8.  **Request Body**: For POST/PUT/PATCH, provide realistic `request.body`. If `Content-Type` is `application/x-www-form-urlencoded`, use `request.formParameters`. If `multipart/form-data` (e.g. file upload), use `request.fileParameters` (e.g., `{\"name\": \"file\", \"fileName\": \"test.txt\", \"filePath\": \"./test-files/test.txt\"}`) and also set `request.contentType`.");
+            promptBuilder.AppendLine(
+                "9.  **Assertions**: Provide meaningful multiple `assertions`. Atlease 3 assertions. Use `AssertionType` and `AssertionCondition` enums. Examples:");
+            promptBuilder.AppendLine(
+                "    - Status Code: `{\"type\": \"StatusCode\", \"condition\": \"Equals\", \"expectedValue\": 200}`");
+            promptBuilder.AppendLine(
+                "    - Response Time: `{\"type\": \"ResponseTime\", \"condition\": \"LessThan\", \"expectedValue\": 1000}` (in ms)");
+            promptBuilder.AppendLine(
+                "    - Header: `{\"type\": \"HeaderValue\", \"target\": \"Content-Type\", \"condition\": \"Contains\", \"expectedValue\": \"application/json\"}`");
+            promptBuilder.AppendLine(
+                "    - JSON Body Field: `{\"type\": \"JsonPathValue\", \"target\": \"data.user.id\", \"condition\": \"Equals\", \"expectedValue\": 123}`");
+            promptBuilder.AppendLine(
+                "    - Body Contains: `{\"type\": \"BodyContainsString\", \"condition\": \"Contains\", \"expectedValue\": \"Success\"}`");
+            promptBuilder.AppendLine(
+                "10. **Variables**: Use `{{variableName}}` for dynamic values (e.g., IDs, tokens) that might be set globally or extracted from previous tests. Define `extractVariables` if this endpoint's response provides data for subsequent tests.");
+            promptBuilder.AppendLine(
+                "11. **Realistic Data**: Use placeholder values that make sense for the schema types (e.g., `\"test@example.com\"` for email, `123` for integer, `\"Sample String\"` for string). For schemas with examples, try to use or adapt them.");
+            promptBuilder.AppendLine("12. **Tags**: Add relevant tags like `[\"functional\", \"smoke\"]`.");
+            promptBuilder.AppendLine(
+                "13. **Skip**: Set `\"skip\": false` unless there's a reason to generate a skipped test.");
             promptBuilder.AppendLine();
-            
-            promptBuilder.AppendLine("## INSTRUCTIONS");
-            promptBuilder.AppendLine("1. Analyze the endpoint details thoroughly");
-            promptBuilder.AppendLine("2. Consider the business logic implied by the API design");
-            promptBuilder.AppendLine("3. Think about what could go wrong from both technical and business perspectives");
-            promptBuilder.AppendLine("4. Ensure coverage of different response codes, including error responses");
-            promptBuilder.AppendLine("5. Use realistic but safe test data - no real PII, credentials, or harmful content");
-            promptBuilder.AppendLine("6. For required fields, provide valid values; for optional fields, test both with and without values");
-            promptBuilder.AppendLine("7. For enums, test all possible values at least once");
-            promptBuilder.AppendLine("8. Consider data type constraints, length limits, and format validation");
-            promptBuilder.AppendLine("9. For arrays, test empty, single item, and multiple items scenarios");
-            promptBuilder.AppendLine("10. For objects, test different combinations of properties");
-            promptBuilder.AppendLine();
-            
-            promptBuilder.AppendLine("Please provide the test cases in a JSON array format, with each test case following the structure above.");
+
+            promptBuilder.AppendLine("Provide ONLY the JSON array of test cases.");
 
             return promptBuilder.ToString();
         }
 
-        private async Task<string> CallGeminiAsync(string prompt)
+        private string GetJsonTestCaseSchema()
         {
-            var client = _httpClientFactory.CreateClient();
-            
+            // This can be manually crafted or, for more robustness,
+            // serialize a default instance of TestCase and its sub-objects.
+            // For now, a manual string matching your TestCase model and enums.
+            // THIS IS CRUCIAL and must exactly match your TestCase structure and enum values.
+            return """
+                   {
+                     "testCaseId": "string (unique, e.g., TC_Method_Path_Scenario)",
+                     "testCaseName": "string (descriptive)",
+                     "description": "string (detailed explanation of the test)",
+                     "priority": "Lowest | Low | Medium | High | Highest",
+                     "tags": ["string"],
+                     "prerequisites": ["string (testCaseId of a prerequisite test)"],
+                     "variables": { "key": "value" }, // Test-case specific variables
+                     "authentication": { // Optional, include if auth is needed
+                       "type": "None | Basic | BearerToken | ApiKey",
+                       "username": "string (for Basic)",
+                       "password": "string (for Basic, use {{variable}} for secrets)",
+                       "token": "string (for BearerToken, use {{variable}})",
+                       "apiKeyHeaderName": "string (for ApiKey)",
+                       "apiKeyValue": "string (for ApiKey, use {{variable}})",
+                       "apiKeyLocation": "Header | QueryParameter (for ApiKey)"
+                     },
+                     "request": {
+                       "method": "GET | POST | PUT | DELETE | PATCH | HEAD | OPTIONS",
+                       "path": "string (e.g., /users/{{userId}})",
+                       "headers": { "HeaderName": "HeaderValue {{variable}}" },
+                       "pathParameters": { "paramName": "value {{variable}}" },
+                       "queryParameters": { "paramName": "value {{variable}}" },
+                       "contentType": "string (e.g., application/json, multipart/form-data, application/x-www-form-urlencoded)",
+                       "body": { /* JSON object/array, or string for other content types */ },
+                       "formParameters": { "key": "value" }, // For application/x-www-form-urlencoded
+                       "fileParameters": [ // For multipart/form-data
+                         {
+                           "name": "string (form field name for file)",
+                           "fileName": "string (e.g., document.pdf)",
+                           "filePath": "string (e.g., ./testdata/document.pdf, if using local files)",
+                           "fileContentBase64": "string (base64 encoded content, alternative to filePath)",
+                           "contentType": "string (e.g., application/pdf)"
+                         }
+                       ]
+                     },
+                     "expectedResponse": { // Optional, assertions are primary
+                       "statusCode": 0, // integer (e.g., 200, 404)
+                       "headers": { "HeaderName": "ExpectedHeaderValue" },
+                       "body": { /* Expected JSON structure or string */ },
+                       "schema": "string (path to schema or schema content - advanced)"
+                     },
+                     "assertions": [
+                       {
+                         "description": "string (optional)",
+                         "type": "StatusCode | ResponseTime | HeaderExists | HeaderValue | BodyContainsString | BodyEqualsString | BodyMatchesRegex | JsonPathValue | JsonPathExists | JsonPathNotExists | JsonSchemaValidation | XmlPathValue | XmlSchemaValidation | ArrayLength | ArrayContains",
+                         "target": "string (e.g., JSONPath 'data.id', header name 'X-RateLimit-Limit', or null for StatusCode/ResponseTime)",
+                         "condition": "Equals | NotEquals | Contains | NotContains | GreaterThan | LessThan | GreaterThanOrEquals | LessThanOrEquals | MatchesRegex | NotMatchesRegex | Exists | NotExists | IsEmpty | IsNotEmpty | IsNull | IsNotNull | IsValid | IsNotValid",
+                         "expectedValue": "any (string, number, boolean, null, or regex pattern)"
+                       }
+                     ],
+                     "extractVariables": [
+                       {
+                         "variableName": "string (e.g., newUserId)",
+                         "source": "ResponseBody | ResponseHeader | ResponseStatusCode",
+                         "path": "string (JSONPath for body, Header name for headers)",
+                         "regex": "string (optional regex to apply on extracted value)"
+                       }
+                     ],
+                     "mockRequirements": null, // Or provide example if needed: [{ "service": "...", "endpoint": "..."}]
+                     "skip": false
+                   }
+                   """;
+        }
+
+        private async Task<string> CallLlmAsync(string prompt)
+        {
+            // Your existing CallGeminiAsync logic can be used here
+            // Ensure it's robust, handles API limits, retries, etc.
+            var client = httpClientFactory.CreateClient("LlmClient"); // Use a named client
+
+            // Make sure _settings.GeminiApiKey is correctly loaded
+            if (string.IsNullOrEmpty(_settings.GeminiApiKey))
+            {
+                logger.LogError("LLM API Key is not configured.");
+                return string.Empty;
+            }
+
             var requestBody = new
             {
                 contents = new[]
                 {
-                    new
-                    {
-                        role = "user",
-                        parts = new[]
-                        {
-                            new { text = prompt }
-                        }
-                    }
+                    new { role = "user", parts = new[] { new { text = prompt } } }
                 },
                 generationConfig = new
                 {
-                    temperature = 0.2,
+                    temperature = 0.2, // Lower for more deterministic/schema-adherent output
                     topP = 0.8,
-                    maxOutputTokens = 8192  // Increased to handle multiple test cases
+                    maxOutputTokens = 8192,
+                    // Potentially add response_mime_type = "application/json" if the LLM API supports it
+                    // to encourage JSON output directly. Some models have specific JSON modes.
                 }
+                // safetySettings can be added if needed
             };
+
+            var requestJson = JsonSerializer.Serialize(requestBody,
+                new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
+            logger.LogTrace("LLM Request Body: {RequestBody}", requestJson);
 
             var request = new HttpRequestMessage(HttpMethod.Post,
-                $"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={_settings.GeminiApiKey}");
-            request.Content = new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, "application/json");
+                $"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={_settings.GeminiApiKey}"); // Updated model
+            request.Content = new StringContent(requestJson, Encoding.UTF8, "application/json");
 
-            var response = await client.SendAsync(request);
-            response.EnsureSuccessStatusCode();
-            
-            var responseContent = await response.Content.ReadAsStringAsync();
-            var responseObject = JsonSerializer.Deserialize<GeminiResponse>(responseContent);
-            
-            return responseObject?.Candidates?[0]?.Content?.Parts?[0]?.Text ?? string.Empty;
-        }
-
-        private string SerializeSchemaForPrompt(OpenApiSchema schema)
-        {
-            var result = new StringBuilder();
-            result.Append($"Type: {schema.Type}");
-            
-            if (schema.Properties?.Count > 0)
+            try
             {
-                result.AppendLine(", Properties:");
-                foreach (var prop in schema.Properties)
+                var response = await client.SendAsync(request);
+                var responseContent = await response.Content.ReadAsStringAsync();
+
+                if (!response.IsSuccessStatusCode)
                 {
-                    string required = schema.Required?.Contains(prop.Key) == true ? "required" : "optional";
-                    result.AppendLine($"    - {prop.Key} ({prop.Value.Type}, {required}): {prop.Value.Description}");
-                    
-                    // Handle nested objects
-                    if (prop.Value.Type == "object" && prop.Value.Properties?.Count > 0)
-                    {
-                        result.AppendLine($"      Nested properties:");
-                        foreach (var nestedProp in prop.Value.Properties)
-                        {
-                            string nestedRequired = prop.Value.Required?.Contains(nestedProp.Key) == true ? "required" : "optional";
-                            result.AppendLine($"        - {nestedProp.Key} ({nestedProp.Value.Type}, {nestedRequired}): {nestedProp.Value.Description}");
-                        }
-                    }
-                    
-                    // Handle enums
-                    if (prop.Value.Enum?.Count > 0)
-                    {
-                        result.Append($"      Allowed values: [");
-                        result.Append(string.Join(", ", prop.Value.Enum));
-                        result.AppendLine("]");
-                    }
+                    logger.LogError("LLM API call failed with status {StatusCode}. Response: {Response}",
+                        response.StatusCode, responseContent);
+                    return string.Empty;
                 }
+
+                logger.LogTrace("LLM Raw Response: {ResponseContent}", responseContent);
+
+                // Assuming GeminiResponse model is defined as you had before or similar
+                var responseObject = JsonSerializer.Deserialize<GeminiResponse>(responseContent);
+
+                string? textResponse = responseObject?.Candidates?[0]?.Content?.Parts?[0]?.Text;
+
+                if (string.IsNullOrWhiteSpace(textResponse))
+                {
+                    logger.LogWarning("LLM returned a candidate but the text part is empty.");
+                    return string.Empty;
+                }
+
+                // Clean the response: LLMs sometimes wrap JSON in ```json ... ```
+                textResponse = textResponse.Trim();
+                if (textResponse.StartsWith("```json"))
+                {
+                    textResponse = textResponse.Substring(7);
+                }
+
+                if (textResponse.StartsWith("```")) // Handle cases with just ```
+                {
+                    textResponse = textResponse.Substring(3);
+                }
+
+                if (textResponse.EndsWith("```"))
+                {
+                    textResponse = textResponse.Substring(0, textResponse.Length - 3);
+                }
+
+                textResponse = textResponse.Trim();
+
+
+                return textResponse;
             }
-            
-            // Handle array items
-            if (schema.Type == "array" && schema.Items != null)
+            catch (Exception ex)
             {
-                result.AppendLine($", Items: {SerializeSchemaForPrompt(schema.Items)}");
+                logger.LogError(ex, "Exception during LLM API call.");
+                return string.Empty;
             }
-            
-            return result.ToString();
-        }
-        private OperationType GetOperationType(string httpMethod)
-        {
-            return httpMethod.ToUpper() switch
-            {
-                "GET" => OperationType.Get,
-                "PUT" => OperationType.Put,
-                "POST" => OperationType.Post,
-                "DELETE" => OperationType.Delete,
-                "OPTIONS" => OperationType.Options,
-                "HEAD" => OperationType.Head,
-                "PATCH" => OperationType.Patch,
-                "TRACE" => OperationType.Trace,
-                _ => OperationType.Get
-            };
         }
     }
+
+    // Assuming GeminiResponse model (you had this before)
+    public class GeminiResponse
+    {
+        /* ... structure from your previous code or API doc ... */
+        [JsonPropertyName("candidates")] public List<GeminiCandidate>? Candidates { get; set; }
+    }
+
+    public class GeminiCandidate
+    {
+        [JsonPropertyName("content")] public GeminiContent? Content { get; set; }
+        // finishReason, safetyRatings etc.
+    }
+
+    public class GeminiContent
+    {
+        [JsonPropertyName("parts")] public List<GeminiPart>? Parts { get; set; }
+        [JsonPropertyName("role")] public string? Role { get; set; }
+    }
+
+    public class GeminiPart
+    {
+        [JsonPropertyName("text")] public string? Text { get; set; }
+    }
+
+
+    // --- gentest.Services/ITestCaseExtractionService.cs (Interface - likely exists) ---
+    // namespace gentest.Services { public interface ITestCaseExtractionService { List<TestCase> ExtractTestCasesFromResponse(string llmResponse); } }
+
+    // --- gentest.Services/TestCaseExtractionService.cs (Implementation needs to be robust) ---
+    // using System.Text.Json;
+    // using gentest.Models.Common;
+    // namespace gentest.Services 
+    // {
+    //     public class TestCaseExtractionService : ITestCaseExtractionService
+    //     {
+    //         private readonly ILogger<TestCaseExtractionService> _logger;
+    //         private static readonly JsonSerializerOptions _jsonOptions = new JsonSerializerOptions
+    //         {
+    //             PropertyNameCaseInsensitive = true, // Important
+    //             // Add converters for your enums if needed, though string enums should deserialize ok
+    //         };
+    //
+    //         public TestCaseExtractionService(ILogger<TestCaseExtractionService> logger)
+    //         {
+    //             _logger = logger;
+    //         }
+    //
+    //         public List<TestCase> ExtractTestCasesFromResponse(string llmResponse)
+    //         {
+    //             if (string.IsNullOrWhiteSpace(llmResponse)) return new List<TestCase>();
+    //             try
+    //             {
+    //                 var testCases = JsonSerializer.Deserialize<List<TestCase>>(llmResponse, _jsonOptions);
+    //                 return testCases ?? new List<TestCase>();
+    //             }
+    //             catch (JsonException ex)
+    //             {
+    //                 _logger.LogError(ex, "Failed to deserialize LLM response into List<TestCase>. Response was: {LLMResponse}", llmResponse.Substring(0, Math.Min(llmResponse.Length, 1000)));
+    //                 // Attempt to find JSON array within potentially messy output
+    //                 // (simple approach, more robust regex might be needed)
+    //                 var startIndex = llmResponse.IndexOf("[");
+    //                 var endIndex = llmResponse.LastIndexOf("]");
+    //                 if (startIndex != -1 && endIndex != -1 && endIndex > startIndex) {
+    //                     var potentialJsonArray = llmResponse.Substring(startIndex, endIndex - startIndex + 1);
+    //                     try {
+    //                         var testCases = JsonSerializer.Deserialize<List<TestCase>>(potentialJsonArray, _jsonOptions);
+    //                         _logger.LogWarning("Successfully parsed a JSON array after initial deserialization failure from substring.");
+    //                         return testCases ?? new List<TestCase>();
+    //                     } catch (JsonException innerEx) {
+    //                         _logger.LogError(innerEx, "Failed to deserialize even the extracted JSON array substring: {JsonSubstring}", potentialJsonArray.Substring(0, Math.Min(potentialJsonArray.Length, 1000)));
+    //                     }
+    //                 }
+    //                 return new List<TestCase>();
+    //             }
+    //         }
+    //     }
+    // }
 }

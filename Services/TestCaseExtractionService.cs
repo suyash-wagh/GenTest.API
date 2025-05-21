@@ -1,182 +1,237 @@
 using System.Text.Json;
-using gentest.Models.Common;
+using System.Text.Json.Serialization; // For JsonStringEnumConverter
+using System.Text.RegularExpressions;
+using GenTest.Models.Common; // Assuming TestCase is here
+using Microsoft.Extensions.Logging;
 
-namespace gentest.Services
+namespace GenTest.Services
 {
     public class TestCaseExtractionService : ITestCaseExtractionService
     {
         private readonly ILogger<TestCaseExtractionService> _logger;
+        private static readonly JsonSerializerOptions _jsonSerializerOptions = new()
+        {
+            PropertyNameCaseInsensitive = true,
+            AllowTrailingCommas = true,
+            ReadCommentHandling = JsonCommentHandling.Skip,
+            Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase, allowIntegerValues: false) } 
+        };
+
+        // Regex for matching a JSON object (handles nested braces)
+        private static readonly Regex JsonObjectRegex = new Regex(
+            @"\{(?:[^{}]|(?<open>\{)|(?<-open>\}))*(?(open)(?!))\}",
+            RegexOptions.Singleline | RegexOptions.Compiled);
+
+        // Regex for matching a JSON array of objects
+        private static readonly Regex JsonArrayOfObjectsRegex = new Regex(
+            @"\[\s*(" + JsonObjectRegex.ToString() + @"(?:\s*,\s*" + JsonObjectRegex.ToString() + @")*\s*)?\]",
+            RegexOptions.Singleline | RegexOptions.Compiled);
+
 
         public TestCaseExtractionService(ILogger<TestCaseExtractionService> logger)
         {
             _logger = logger;
         }
 
-        public List<TestCase> ExtractTestCasesFromResponse(string response)
+        public List<TestCase> ExtractTestCasesFromResponse(string llmResponse)
         {
+            if (string.IsNullOrWhiteSpace(llmResponse))
+            {
+                _logger.LogWarning("LLM response is null or empty.");
+                return new List<TestCase>();
+            }
+
             var testCases = new List<TestCase>();
+            string cleanedResponse = CleanLLMResponse(llmResponse);
+
+            if (string.IsNullOrWhiteSpace(cleanedResponse) || cleanedResponse.Length < 10) // Basic sanity check
+            {
+                _logger.LogWarning("Cleaned LLM response is too short or empty. Original: {Original}", llmResponse.Substring(0, Math.Min(500, llmResponse.Length)));
+                return testCases;
+            }
 
             try
             {
-                var cleanedResponse = CleanLLMResponse(response);
+                // Attempt 1: Try to parse as a direct List<TestCase>
                 try
                 {
-                    var options = new JsonSerializerOptions
+                    var directParse = JsonSerializer.Deserialize<List<TestCase>>(cleanedResponse, _jsonSerializerOptions);
+                    if (directParse != null)
                     {
-                        PropertyNameCaseInsensitive = true,
-                        AllowTrailingCommas = true
-                    };
-
-                    var directParse = JsonSerializer.Deserialize<List<TestCase>>(cleanedResponse, options);
-                    if (directParse != null && directParse.Count > 0)
-                    {
-                        _logger.LogInformation("Successfully parsed response directly as JSON array with {Count} test cases", directParse.Count);
-                        return directParse;
+                        var validDirectParse = directParse.Where(IsValidTestCase).ToList();
+                        if (validDirectParse.Any())
+                        {
+                            _logger.LogInformation("Successfully parsed response directly as JSON array with {Count} valid test cases.", validDirectParse.Count);
+                            return validDirectParse;
+                        }
                     }
                 }
                 catch (JsonException ex)
                 {
-                    _logger.LogDebug(ex, "Direct JSON parsing failed, proceeding with regex extraction");
+                    _logger.LogDebug(ex, "Direct JSON array parsing failed. Cleaned response (first 500 chars): {CleanedResponsePreview}", cleanedResponse.Substring(0, Math.Min(500, cleanedResponse.Length)));
+                    // Continue to other attempts
                 }
-
-                // Second try: Extract JSON arrays from the response using regex
-                var jsonArrayMatches = System.Text.RegularExpressions.Regex.Matches(
-                    response,
-                    @"\[\s*\{(?:[^{}]|(?<open>\{)|(?<-open>\}))*(?(open)(?!))\}\s*\]",
-                    System.Text.RegularExpressions.RegexOptions.Singleline
-                );
-
-                if (jsonArrayMatches.Count > 0)
+                
+                Match arrayMatch = JsonArrayOfObjectsRegex.Match(cleanedResponse);
+                if (arrayMatch.Success)
                 {
-                    // Try each JSON array found (in case there are multiple)
-                    foreach (System.Text.RegularExpressions.Match arrayMatch in jsonArrayMatches)
-                    {
-                        try
-                        {
-                            var jsonArray = arrayMatch.Value;
-                            var extractedTestCases = JsonSerializer.Deserialize<List<TestCase>>(jsonArray, new JsonSerializerOptions
-                            {
-                                PropertyNameCaseInsensitive = true,
-                                AllowTrailingCommas = true
-                            });
-
-                            if (extractedTestCases != null && extractedTestCases.Count > 0)
-                            {
-                                // Check if these are valid test cases (basic validation)
-                                var validTestCases = extractedTestCases.Where(tc =>
-                                    !string.IsNullOrEmpty(tc.TestCaseId) &&
-                                    !string.IsNullOrEmpty(tc.TestCaseName)).ToList();
-
-                                if (validTestCases.Count > 0)
-                                {
-                                    testCases.AddRange(validTestCases);
-                                    _logger.LogInformation("Extracted {Count} valid test cases from JSON array", validTestCases.Count);
-
-                                    // If we found valid test cases, we can return early
-                                    if (testCases.Count > 0)
-                                    {
-                                        return testCases;
-                                    }
-                                }
-                            }
-                        }
-                        catch (JsonException arrayEx)
-                        {
-                            _logger.LogDebug(arrayEx, "Failed to parse JSON array match");
-                        }
-                    }
-                }
-
-                // Third try: Extract individual JSON objects if array extraction failed
-                _logger.LogInformation("No valid JSON arrays found or parsing failed, trying to extract individual test cases");
-                var jsonObjectMatches = System.Text.RegularExpressions.Regex.Matches(
-                    response,
-                    @"\{(?:[^{}]|(?<open>\{)|(?<-open>\}))*(?(open)(?!))\}",
-                    System.Text.RegularExpressions.RegexOptions.Singleline
-                );
-
-                foreach (System.Text.RegularExpressions.Match match in jsonObjectMatches)
-                {
+                    string potentialJsonArray = arrayMatch.Value;
                     try
                     {
-                        var jsonObj = match.Value;
-                        // Skip very short matches that are unlikely to be complete test cases
-                        if (jsonObj.Length < 50) continue;
-
-                        var testCase = JsonSerializer.Deserialize<TestCase>(jsonObj, new JsonSerializerOptions
+                        var extractedTestCases = JsonSerializer.Deserialize<List<TestCase>>(potentialJsonArray, _jsonSerializerOptions);
+                        if (extractedTestCases != null)
                         {
-                            PropertyNameCaseInsensitive = true,
-                            AllowTrailingCommas = true
-                        });
-
-                        if (testCase != null && !string.IsNullOrEmpty(testCase.TestCaseId) && !string.IsNullOrEmpty(testCase.TestCaseName))
-                        {
-                            testCases.Add(testCase);
-                            _logger.LogDebug("Added individual test case: {Id}", testCase.TestCaseId);
+                            var validExtractedTestCases = extractedTestCases.Where(IsValidTestCase).ToList();
+                            if (validExtractedTestCases.Any())
+                            {
+                                _logger.LogInformation("Successfully parsed JSON array extracted by regex with {Count} valid test cases.", validExtractedTestCases.Count);
+                                return validExtractedTestCases;
+                            }
                         }
                     }
-                    catch (JsonException objEx)
+                    catch (JsonException ex)
                     {
-                        _logger.LogDebug(objEx, "Failed to parse individual JSON object");
+                        _logger.LogDebug(ex, "Parsing JSON array extracted by regex failed. Array (first 500 chars): {JsonArrayPreview}", potentialJsonArray.Substring(0, Math.Min(500, potentialJsonArray.Length)));
+                        // Continue to individual object parsing
+                    }
+                }
+                
+                _logger.LogInformation("No valid JSON array found or parsing failed, attempting to extract individual test case objects.");
+                var objectMatches = JsonObjectRegex.Matches(cleanedResponse);
+                var individualTestCases = new List<TestCase>();
+
+                foreach (Match match in objectMatches)
+                {
+                    string potentialJsonObj = match.Value;
+                    if (potentialJsonObj.Length < 50) continue;
+
+                    try
+                    {
+                        var testCase = JsonSerializer.Deserialize<TestCase>(potentialJsonObj, _jsonSerializerOptions);
+                        if (IsValidTestCase(testCase))
+                        {
+                            individualTestCases.Add(testCase!);
+                        }
+                    }
+                    catch (JsonException ex)
+                    {
+                        _logger.LogDebug(ex, "Failed to parse individual JSON object. Object (first 500 chars): {JsonObjectPreview}", potentialJsonObj.Substring(0, Math.Min(500, potentialJsonObj.Length)));
                     }
                 }
 
-                if (testCases.Count > 0)
+                if (individualTestCases.Any())
                 {
-                    _logger.LogInformation("Successfully extracted {Count} individual test cases", testCases.Count);
+                    _logger.LogInformation("Successfully extracted {Count} valid individual test cases after array parsing failed.", individualTestCases.Count);
+                    return individualTestCases;
                 }
                 else
                 {
-                    _logger.LogWarning("Failed to extract any valid test cases from LLM response");
+                    _logger.LogWarning("Failed to extract any valid test cases from LLM response after all attempts. Cleaned response (first 500 chars): {CleanedResponsePreview}", cleanedResponse.Substring(0, Math.Min(500, cleanedResponse.Length)));
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Unexpected error extracting test cases from LLM response");
+                _logger.LogError(ex, "Unexpected error during test case extraction process. Cleaned response (first 500 chars): {CleanedResponsePreview}", cleanedResponse.Substring(0, Math.Min(500, cleanedResponse.Length)));
             }
 
             return testCases;
         }
 
-        /// <summary>
-        /// Cleans LLM response by removing markdown code blocks and other non-JSON content
-        /// </summary>
+        private bool IsValidTestCase(TestCase? tc)
+        {
+            if (tc == null) return false;
+
+            // Core requirements
+            if (string.IsNullOrWhiteSpace(tc.TestCaseId) ||
+                string.IsNullOrWhiteSpace(tc.TestCaseName) || // Name is also important
+                tc.Request == null ||
+                string.IsNullOrWhiteSpace(tc.Request.Path)) // Request and Path are fundamental
+            {
+                _logger.LogDebug("TestCase marked invalid due to missing Id, Name, Request, or Request.Path. ID: {Id}, Name: {Name}", tc.TestCaseId, tc.TestCaseName);
+                return false;
+            }
+
+            if (tc.Assertions != null)
+            {
+                foreach (var assertion in tc.Assertions)
+                {
+                    if (assertion == null)
+                    {
+                        _logger.LogDebug("TestCase {Id} has a null or potentially invalid assertion.", tc.TestCaseId);
+                    }
+                }
+            }
+
+            return true;
+        }
+
         private string CleanLLMResponse(string response)
         {
-            if (string.IsNullOrEmpty(response))
-                return "[]";
+            if (string.IsNullOrWhiteSpace(response))
+                return string.Empty;
 
-            // Remove markdown code block syntax
-            var cleaned = System.Text.RegularExpressions.Regex.Replace(
-                response,
-                @"```(?:json|csharp|cs|javascript|js|)?([\s\S]*?)```",
-                "$1"
-            ).Trim();
+            string cleaned = response;
 
-            // If we have removed everything or nearly everything, return the original
-            if (string.IsNullOrWhiteSpace(cleaned) || cleaned.Length < response.Length / 10)
+            cleaned = Regex.Replace(cleaned, @"^\s*```(?:[a-zA-Z0-9]*)?\s*([\s\S]*?)\s*```\s*$", "$1", RegexOptions.Multiline);
+            cleaned = cleaned.Trim();
+            
+            var firstBrace = cleaned.IndexOf('{');
+            var firstBracket = cleaned.IndexOf('[');
+
+            if (firstBrace == -1 && firstBracket == -1)
             {
-                cleaned = response;
+                _logger.LogDebug("No JSON start characters ('{{' or '[') found in cleaned response: {CleanedPreview}", cleaned.Substring(0, Math.Min(100, cleaned.Length)));
+                return string.Empty;
             }
 
-            // Ensure the response starts with [ and ends with ] for array parsing
-            if (!cleaned.StartsWith("["))
+            int startIndex = -1;
+            char startChar = ' ';
+            char endChar = ' ';
+
+            if (firstBracket != -1 && (firstBrace == -1 || firstBracket < firstBrace))
             {
-                var firstBracket = cleaned.IndexOf('[');
-                if (firstBracket >= 0)
+                // Starts with an array
+                startIndex = firstBracket;
+                startChar = '[';
+                endChar = ']';
+            }
+            else if (firstBrace != -1 && (firstBracket == -1 || firstBrace < firstBracket))
+            {
+                // Starts with an object
+                startIndex = firstBrace;
+                startChar = '{';
+                endChar = '}';
+            }
+
+            if (startIndex != -1)
+            {
+                int balance = 0;
+                int endIndex = -1;
+                for (int i = startIndex; i < cleaned.Length; i++)
                 {
-                    cleaned = cleaned.Substring(firstBracket);
+                    if (cleaned[i] == startChar) balance++;
+                    else if (cleaned[i] == endChar) balance--;
+
+                    if (balance == 0)
+                    {
+                        endIndex = i;
+                        break;
+                    }
+                }
+
+                if (endIndex != -1)
+                {
+                    cleaned = cleaned.Substring(startIndex, endIndex - startIndex + 1);
+                }
+                else
+                {
+                     _logger.LogDebug("Could not find balanced end for JSON structure starting with '{StartChar}'. Original (first 100): {CleanedPreview}", startChar, cleaned.Substring(0, Math.Min(100, cleaned.Length)));
                 }
             }
 
-            // Ensure proper closing of the JSON array
-            if (!cleaned.EndsWith("]"))
+            if (string.IsNullOrWhiteSpace(cleaned))
             {
-                var lastBracket = cleaned.LastIndexOf(']');
-                if (lastBracket >= 0)
-                {
-                    cleaned = cleaned.Substring(0, lastBracket + 1);
-                }
+                _logger.LogDebug("Response became empty after cleaning. Original (first 100): {OriginalPreview}", response.Substring(0, Math.Min(100, response.Length)));
             }
 
             return cleaned;

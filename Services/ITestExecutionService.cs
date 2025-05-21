@@ -1,14 +1,14 @@
-using System.Threading.Tasks;
-using gentest.Models.Common;
-using gentest.Models.TestExecution;
+using GenTest.Models.Common;
+using GenTest.Models.TestExecution;
 
-namespace gentest.Services
+namespace GenTest.Services
 {
     public interface ITestExecutionService
     {
-        public Task<List<TestCaseResult>> ExecuteTestCasesAsync(
-            List<TestCase> testCases, 
-            string baseUrl, 
+        Task<TestRunResult> ExecuteTestRunAsync(
+            List<TestCase> testCases,
+            string baseUrl,
+            Dictionary<string, object>? globalVariables = null,
             Dictionary<string, string>? globalHeaders = null,
             CancellationToken cancellationToken = default);
     }

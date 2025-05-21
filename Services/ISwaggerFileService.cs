@@ -7,6 +7,5 @@ namespace gentest.Services
     {
         Task<string> SaveSwaggerFileAsync(IFormFile file);
         Task<List<string>> ParseSwaggerFileAsync(string filePath);
-        // Add other methods related to swagger file processing if needed
     }
 }

@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace gentest.Models.TestGeneration
+namespace GenTest.Models.TestGeneration
 {
     // Helper classes for deserializing Gemini responses
     public class GeminiResponse

@@ -1,6 +1,6 @@
-using gentest.Models.Common;
+using GenTest.Models.Common;
 
-namespace gentest.Services;
+namespace GenTest.Services;
 public interface ITestCaseExtractionService
 {
     List<TestCase> ExtractTestCasesFromResponse(string response);

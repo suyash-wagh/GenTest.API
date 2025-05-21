@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace gentest.Models.Common
+namespace GenTest.Models.Common
 {
     public class MockRequirement
     {

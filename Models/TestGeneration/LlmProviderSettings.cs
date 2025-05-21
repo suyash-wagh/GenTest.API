@@ -1,4 +1,4 @@
-namespace gentest.Models.TestGeneration
+namespace GenTest.Models.TestGeneration
 {
     // Settings class for Gemini configuration
     public class LlmProviderSettings

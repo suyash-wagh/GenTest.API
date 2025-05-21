@@ -1,15 +1,32 @@
-namespace gentest.Models.TestExecution
+using System.Text.Json.Serialization;
+using GenTest.Models.Common;
+
+namespace GenTest.Models.TestExecution
 {
     public class AssertionResult
     {
-        public string Type { get; set; }
-        public string Target { get; set; }
-        public string Condition { get; set; }
-        public object ExpectedValue { get; set; }
-        public object ActualValue { get; set; }
+        [JsonPropertyName("description")]
+        public string? Description { get; set; }
+
+        [JsonPropertyName("type")]
+        public AssertionType Type { get; set; }
+
+        [JsonPropertyName("target")]
+        public string? Target { get; set; }
+
+        [JsonPropertyName("condition")]
+        public AssertionCondition Condition { get; set; }
+
+        [JsonPropertyName("expectedValue")]
+        public object? ExpectedValue { get; set; }
+
+        [JsonPropertyName("actualValue")]
+        public object? ActualValue { get; set; }
+
+        [JsonPropertyName("passed")]
         public bool Passed { get; set; }
-        public string Message { get; set; }
-        public string ErrorMessage { get; set; }
-        public string Exception { get; set; }
+
+        [JsonPropertyName("message")]
+        public string? Message { get; set; }
     }
 }
